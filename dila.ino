@@ -2,7 +2,7 @@
   ==========================================================
   SISTEM MONITORING DAN PENGENDALIAN OTOMATIS
   BIBIT KELAPA SAWIT BERBASIS INTERNET OF THINGS
-  (Blynk + Thinger.io + ESP-NOW + Google Sheets)
+  (Blynk + Thinger.io + ESP-NOW + Google Sheets + MQTT + Serial Manual)
   ==========================================================
 */
 
@@ -31,14 +31,29 @@
 #include <Wire.h>
 #include <LiquidCrystal_I2C.h>
 #include <DHT.h>
+#include <PubSubClient.h> 
 
 // ==========================================================
 // KONFIGURASI WI-FI & URL
 // ==========================================================
-char ssid[] = "SoC22";
-char pass[] = "soc12345";
+char ssid[] = "lida";
+char pass[] = "nanasmuda";
 
 String GOOGLE_SCRIPT_URL_D3 = "https://script.google.com/macros/s/AKfycbxIHvZ4xddd_aN-op7BwsFq3fzGBYlvb7ob5Ap6JJ7udYeA6k14m_WSZtoTCBPnI5qi/exec";
+
+// ==========================================================
+// KONFIGURASI MQTT 
+// ==========================================================
+const char* mqtt_server = "broker.hivemq.com";
+const int mqtt_port = 1883;
+
+const char* topic_ph = "sawit/monitor/ph";
+const char* topic_rh_udara = "sawit/monitor/kelembapan_udara";
+const char* topic_rh_tanah = "sawit/monitor/kelembapan_tanah";
+const char* topic_suhu = "sawit/monitor/suhu_udara";
+
+WiFiClient espClientMQTT;
+PubSubClient mqttClient(espClientMQTT);
 
 // ==========================================================
 // KONFIGURASI PIN & OBJEK
@@ -80,9 +95,8 @@ const unsigned long INTERVAL_TANAH = 3000UL;
 const unsigned long INTERVAL_PH = 5000UL;
 const unsigned long INTERVAL_LCD = 500UL;
 const unsigned long INTERVAL_CLOUD_D3 = 60000UL; 
-
-// INTERVAL PENGIRIMAN BLYNK (1000ms untuk mencegah Flood Error)
 const unsigned long INTERVAL_BLYNK_SEND = 1000UL;      
+const unsigned long INTERVAL_MQTT_SEND = 5000UL; 
 
 const unsigned long WAKTU_STABILISASI_DMS = 500UL;
 const unsigned long INTERVAL_SAMPEL_PH = 20UL;
@@ -98,17 +112,16 @@ float adcKelembapanTanah = NAN, kelembapanTanah = NAN;
 
 bool statusPompa = false, statusKipasMasuk = false, statusKipasBuang = false;
 bool permintaanKipasMasuk = false, permintaanKipasBuang = false;
+bool modeSensorManual = false; // TRUE = Data dari Serial Monitor, FALSE = Data dari Sensor
 
-// Variabel Kontrol Manual Pompa
 String modePompaBlynk = "OFF"; 
 bool statusManualThinger = false;
-
-// Variabel Pencegah Flood Error Blynk
 int tahapanKirimBlynk = 0;
 
 unsigned long waktuDHTSebelumnya = 0, waktuTanahSebelumnya = 0;
 unsigned long waktuPHSebelumnya = 0, waktuLCDSebelumnya = 0, waktuCloudD3Sebelumnya = 0;
 unsigned long waktuCobaWiFiSebelumnya = 0, waktuCobaBlynkSebelumnya = 0;
+unsigned long waktuCobaMQTTSebelumnya = 0, waktuMQTTSebelumnya = 0;
 
 enum StatusPembacaanPH { PH_DIAM, PH_STABILISASI, PH_MENGAMBIL_SAMPEL };
 StatusPembacaanPH statusPembacaanPH = PH_DIAM;
@@ -131,14 +144,8 @@ void OnDataRecv(const uint8_t * mac, const uint8_t *incomingData, int len) {
   memcpy(&dataElsevier, incomingData, sizeof(dataElsevier));
 }
 
-// ==========================================================
-// FUNGSI UMUM & MATEMATIKA
-// ==========================================================
 float batasiPersen(float nilai) { return constrain(nilai, 0.0f, 100.0f); }
 
-// ==========================================================
-// KONTROL AKTUATOR
-// ==========================================================
 void tulisRelay(uint8_t pinRelay, bool menyala) {
   digitalWrite(pinRelay, (RELAY_ACTIVE_LOW) ? (menyala ? LOW : HIGH) : (menyala ? HIGH : LOW));
 }
@@ -147,31 +154,21 @@ void aturPompa(bool menyala) { statusPompa = menyala; tulisRelay(RELAY_POMPA_PIN
 void aturKipasMasuk(bool menyala) { statusKipasMasuk = menyala; tulisRelay(RELAY_KIPAS_MASUK_PIN, statusKipasMasuk); }
 void aturKipasBuang(bool menyala) { statusKipasBuang = menyala; tulisRelay(RELAY_KIPAS_BUANG_PIN, statusKipasBuang); }
 
-// ==========================================================
-// LOGIKA PEMBACAAN DAN EVALUASI SENSOR
-// ==========================================================
 float hitungPHTanah(float nilaiADC) { return constrain((PH_KEMIRINGAN * nilaiADC) + PH_KONSTANTA, 0.0f, 14.0f); }
-
 float hitungKelembapanTanah(float nilaiADC) {
   float rentang = (float)ADC_TANAH_BASAH - (float)ADC_TANAH_KERING;
   if (fabsf(rentang) < 1.0f) return NAN;
   return batasiPersen(((nilaiADC - ADC_TANAH_KERING) / rentang) * 100.0f);
 }
 
-// Logika Kontrol Pompa (HANYA MANUAL BLYNK & THINGER)
 void prosesPompa() {
   if (modePompaBlynk == "ON" || statusManualThinger == true) {
-    if (statusPompa == false) { 
-      aturPompa(true);
-    }
+    if (statusPompa == false) aturPompa(true);
   } else {
-    if (statusPompa == true) { 
-      aturPompa(false);
-    }
+    if (statusPompa == true) aturPompa(false);
   }
 }
 
-// Logika Kontrol Kipas (Tetap Otomatis)
 void evaluasiUdara() {
   if (!isnan(suhu)) {
     if (suhu >= SUHU_KIPAS_MASUK_ON) permintaanKipasMasuk = true;
@@ -189,18 +186,60 @@ void evaluasiUdara() {
 }
 
 // ==========================================================
-// RUTINITAS SENSOR
+// PEMBACAAN INPUT SERIAL MONITOR (UNTUK TESTING MANUAL)
+// ==========================================================
+void bacaSerialMonitor() {
+  if (Serial.available() > 0) {
+    String input = Serial.readStringUntil('\n');
+    input.trim();
+    String inputUpper = input;
+    inputUpper.toUpperCase();
+
+    if (inputUpper == "MANUAL") {
+      modeSensorManual = true;
+      Serial.println(">> MODE MANUAL AKTIF: Sensor fisik diabaikan.");
+    }
+    else if (inputUpper == "SENSOR") {
+      modeSensorManual = false;
+      Serial.println(">> MODE SENSOR AKTIF: Membaca data dari sensor fisik.");
+    }
+    else if (inputUpper.startsWith("SUHU=")) {
+      suhu = input.substring(5).toFloat();
+      modeSensorManual = true;
+      Serial.println(">> (Manual) Suhu disetel ke: " + String(suhu));
+    }
+    else if (inputUpper.startsWith("RHU=")) {
+      kelembapanUdara = input.substring(4).toFloat();
+      modeSensorManual = true;
+      Serial.println(">> (Manual) Kelembapan Udara disetel ke: " + String(kelembapanUdara));
+    }
+    else if (inputUpper.startsWith("RHT=")) {
+      kelembapanTanah = input.substring(4).toFloat();
+      modeSensorManual = true;
+      Serial.println(">> (Manual) Kelembapan Tanah disetel ke: " + String(kelembapanTanah));
+    }
+    else if (inputUpper.startsWith("PH=")) {
+      nilaiPH = input.substring(3).toFloat();
+      modeSensorManual = true;
+      Serial.println(">> (Manual) pH disetel ke: " + String(nilaiPH));
+    }
+  }
+}
+
+// ==========================================================
+// RUTINITAS SENSOR FISIK
 // ==========================================================
 void prosesDHT(unsigned long waktuSekarang) {
+  if (modeSensorManual) return; // Jika mode manual, lewati baca sensor
   if (waktuSekarang - waktuDHTSebelumnya < INTERVAL_DHT) return;
   waktuDHTSebelumnya = waktuSekarang;
   float s = dht.readTemperature(), h = dht.readHumidity();
   suhu = isnan(s) ? NAN : s + OFFSET_SUHU;
   kelembapanUdara = isnan(h) ? NAN : batasiPersen(h + OFFSET_KELEMBAPAN_UDARA);
-  evaluasiUdara();
 }
 
 void prosesKelembapanTanah(unsigned long waktuSekarang) {
+  if (modeSensorManual) return; // Jika mode manual, lewati baca sensor
   if (waktuSekarang - waktuTanahSebelumnya < INTERVAL_TANAH) return;
   waktuTanahSebelumnya = waktuSekarang;
   uint32_t totalADC = 0; int adcMin = 1023, adcMax = 0;
@@ -216,6 +255,7 @@ void prosesKelembapanTanah(unsigned long waktuSekarang) {
 }
 
 void prosesPHTanah(unsigned long waktuSekarang) {
+  if (modeSensorManual) return; // Jika mode manual, lewati baca sensor
   if (statusPembacaanPH == PH_DIAM && waktuSekarang - waktuPHSebelumnya >= INTERVAL_PH) {
     waktuPHSebelumnya = waktuSekarang; digitalWrite(DMS_CONTROL_PIN, HIGH);
     waktuMulaiStabilisasiPH = waktuSekarang;
@@ -243,7 +283,7 @@ void prosesPHTanah(unsigned long waktuSekarang) {
 }
 
 // ==========================================================
-// TAMPILAN LCD
+// TAMPILAN LCD & SERIAL
 // ==========================================================
 void prosesLCD(unsigned long waktuSekarang) {
   if (waktuSekarang - waktuLCDSebelumnya < INTERVAL_LCD) return;
@@ -283,79 +323,56 @@ void prosesLCD(unsigned long waktuSekarang) {
   }
 }
 
-// ==========================================================
-// TAMPILAN SERIAL MONITOR
-// ==========================================================
 void tampilkanSemuaData(unsigned long waktuSekarang) {
   static unsigned long waktuTampilSebelumnya = 0;
   if (waktuSekarang - waktuTampilSebelumnya >= 5000UL) {
     waktuTampilSebelumnya = waktuSekarang;
-    Serial.println("\n=== GABUNGAN DATA (D3 + ELSEVIER) ===");
+    Serial.println("\n=== GABUNGAN DATA ===");
+    Serial.printf("Mode Data  : %s\n", modeSensorManual ? "MANUAL (SERIAL)" : "SENSOR FISIK");
     Serial.printf("Suhu Ruang : %.1f C | RH Ruang: %.1f %%\n", suhu, kelembapanUdara);
     Serial.printf("RH Tanah   : %.1f %% | pH Tanah: %.1f\n", kelembapanTanah, nilaiPH);
-    Serial.printf("V Panel    : %.2f V | Arus PV : %.2f A\n", dataElsevier.vCharge, dataElsevier.iCharge);
-    Serial.printf("V Baterai  : %.2f V | Arus Beban: %.2f A\n", dataElsevier.vLoad, dataElsevier.iLoad);
-    Serial.println("=====================================\n");
+    Serial.println("=====================\n");
   }
 }
 
 // ==========================================================
-// KONEKSI & CLOUD (Blynk, Thinger, G-Sheets)
+// KONEKSI & CLOUD (Blynk, Thinger, G-Sheets, MQTT)
 // ==========================================================
-
-// --- KONTROL MANUAL POMPA DARI BLYNK (V12) ---
 BLYNK_WRITE(V12) {
   String perintah = param.asString();
   perintah.toUpperCase(); 
-  
-  if (perintah == "1" || perintah == "ON") {
-    modePompaBlynk = "ON";
-  } else {
-    modePompaBlynk = "OFF";
-  }
-
-  Serial.print("[Blynk] Perintah Pompa Diterima: ");
-  Serial.println(modePompaBlynk);
+  if (perintah == "1" || perintah == "ON") modePompaBlynk = "ON";
+  else modePompaBlynk = "OFF";
 }
 
-// --- PENGIRIMAN DATA BLYNK MENGGUNAKAN METODE ANTI-FLOOD ---
 void kirimDataBlynk() {
   if (!Blynk.connected()) return;
-  
   switch (tahapanKirimBlynk) {
     case 0:
-      if (!isnan(nilaiPH)) Blynk.virtualWrite(V0, nilaiPH); // V0: Double
-      if (!isnan(suhu)) Blynk.virtualWrite(V1, suhu);       // V2: Double
-      if (!isnan(kelembapanUdara)) Blynk.virtualWrite(V2, (int)round(kelembapanUdara)); // V1: Integer
+      if (!isnan(nilaiPH)) Blynk.virtualWrite(V0, nilaiPH); 
+      if (!isnan(suhu)) Blynk.virtualWrite(V1, suhu);       
+      if (!isnan(kelembapanUdara)) Blynk.virtualWrite(V2, (int)round(kelembapanUdara)); 
       break;
-      
     case 1:
-      Blynk.virtualWrite(V3, statusPompa ? "ON" : "OFF");      // V3: String
-      Blynk.virtualWrite(V4, statusKipasMasuk ? "ON" : "OFF"); // V4: String
-      Blynk.virtualWrite(V5, statusKipasBuang ? "ON" : "OFF"); // V5: String
+      Blynk.virtualWrite(V3, statusPompa ? "ON" : "OFF");      
+      Blynk.virtualWrite(V4, statusKipasMasuk ? "ON" : "OFF"); 
+      Blynk.virtualWrite(V5, statusKipasBuang ? "ON" : "OFF"); 
       break;
-      
     case 2:
-      if (!isnan(kelembapanTanah)) Blynk.virtualWrite(V6, (int)round(kelembapanTanah)); // V6: Integer
+      if (!isnan(kelembapanTanah)) Blynk.virtualWrite(V6, (int)round(kelembapanTanah)); 
       break;
-      
     case 3:
-      Blynk.virtualWrite(V7, dataElsevier.vCharge);  // V7: Double
-      Blynk.virtualWrite(V8, dataElsevier.iCharge);  // V8: Double
+      Blynk.virtualWrite(V7, dataElsevier.vCharge);  
+      Blynk.virtualWrite(V8, dataElsevier.iCharge);  
       break;
-      
     case 4:
-      Blynk.virtualWrite(V9, dataElsevier.vLoad);                 // V9: Double
-      Blynk.virtualWrite(V10, dataElsevier.iLoad);                // V10: Double
-      Blynk.virtualWrite(V11, (int)round(dataElsevier.pLoad));    // V11: Integer (Daya beban)
+      Blynk.virtualWrite(V9, dataElsevier.vLoad);                  
+      Blynk.virtualWrite(V10, dataElsevier.iLoad);                
+      Blynk.virtualWrite(V11, (int)round(dataElsevier.pLoad));    
       break;
   }
-
-  // Naikkan tahapan untuk putaran berikutnya
   tahapanKirimBlynk++;
-  if (tahapanKirimBlynk > 4) {
-    tahapanKirimBlynk = 0;
-  }
+  if (tahapanKirimBlynk > 4) tahapanKirimBlynk = 0;
 }
 
 void prosesKoneksiWiFiBlynk(unsigned long waktuSekarang) {
@@ -375,6 +392,27 @@ void prosesKoneksiWiFiBlynk(unsigned long waktuSekarang) {
   if (Blynk.connected()) Blynk.run();
 }
 
+void prosesKoneksiMQTT(unsigned long waktuSekarang) {
+  if (WiFi.status() != WL_CONNECTED) return;
+  if (!mqttClient.connected()) {
+    if (waktuSekarang - waktuCobaMQTTSebelumnya >= 5000UL) {
+      waktuCobaMQTTSebelumnya = waktuSekarang;
+      String clientId = "SawitESP32-";
+      clientId += String(random(0xffff), HEX);
+      if (mqttClient.connect(clientId.c_str())) Serial.println("[MQTT] Terhubung ke Broker!");
+    }
+  } else {
+    mqttClient.loop();
+    if (waktuSekarang - waktuMQTTSebelumnya >= INTERVAL_MQTT_SEND) {
+      waktuMQTTSebelumnya = waktuSekarang;
+      if (!isnan(suhu)) mqttClient.publish(topic_suhu, String(suhu, 1).c_str());
+      if (!isnan(kelembapanUdara)) mqttClient.publish(topic_rh_udara, String(kelembapanUdara, 1).c_str());
+      if (!isnan(kelembapanTanah)) mqttClient.publish(topic_rh_tanah, String(kelembapanTanah, 1).c_str());
+      if (!isnan(nilaiPH)) mqttClient.publish(topic_ph, String(nilaiPH, 2).c_str());
+    }
+  }
+}
+
 void kirimKeGoogleSheets(unsigned long waktuSekarang) {
   if (waktuSekarang - waktuCloudD3Sebelumnya >= INTERVAL_CLOUD_D3) {
     waktuCloudD3Sebelumnya = waktuSekarang;
@@ -386,12 +424,6 @@ void kirimKeGoogleSheets(unsigned long waktuSekarang) {
       url += "&rh_d3=" + String(isnan(kelembapanUdara) ? 0 : kelembapanUdara, 1);
       url += "&soil_d3=" + String(isnan(kelembapanTanah) ? 0 : kelembapanTanah, 1);
       url += "&ph_d3=" + String(isnan(nilaiPH) ? 0 : nilaiPH, 2);
-      url += "&v_pv=" + String(dataElsevier.vCharge, 2);
-      url += "&i_pv=" + String(dataElsevier.iCharge, 2);
-      url += "&p_pv=" + String(dataElsevier.pCharge, 2);
-      url += "&v_bat=" + String(dataElsevier.vLoad, 2);
-      url += "&i_bat=" + String(dataElsevier.iLoad, 2);
-      url += "&p_bat=" + String(dataElsevier.pLoad, 2);
       
       http.begin(client, url); http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
       int httpCode = http.GET();
@@ -420,55 +452,37 @@ void setup() {
 
   lcd.print("Sistem Bibit"); lcd.setCursor(0, 1); lcd.print("Memulai...");
 
-  // Inisialisasi Wi-Fi Manual
   WiFi.mode(WIFI_STA); WiFi.begin(ssid, pass);
   Blynk.config(BLYNK_AUTH_TOKEN);
-
-  // Inisialisasi Thinger.io Resource
   thing.add_wifi(ssid, pass); 
   
-  // Resource Monitoring Sensor & Status
   thing["DataSawit"] >> [](pson& out){
     out["pH_Tanah"] = isnan(nilaiPH) ? 0.0 : nilaiPH;
     out["Suhu_Ruangan"] = isnan(suhu) ? 0.0 : suhu;
     out["Kelembapan_Udara"] = isnan(kelembapanUdara) ? 0.0 : kelembapanUdara;
     out["Kelembapan_Tanah"] = isnan(kelembapanTanah) ? 0.0 : kelembapanTanah;
-    out["Daya_Pembebanan"] = dataElsevier.pLoad;
-    out["Tegangan_PLTS"] = dataElsevier.vCharge;
-    out["Arus_Panel"] = dataElsevier.iCharge;
-    out["Tegangan_Baterai"] = dataElsevier.vLoad;
-    out["Arus_Baterai"] = dataElsevier.iLoad;
     out["Udara_Masuk"] = statusKipasMasuk;
     out["Udara_Keluar"] = statusKipasBuang;
     out["Status_Pompa"] = statusPompa;
   };
 
-  // Resource Kontrol Manual Pompa dari Thinger.io
   thing["kontrolPompa"] << [](pson& in){
     if(in.is_empty()){
       in = statusManualThinger;
     } else {
       statusManualThinger = in;
-      Serial.print("[Thinger] Kontrol Manual Pompa: ");
-      Serial.println(statusManualThinger ? "ON" : "OFF");
     }
   };
 
-  // Inisialisasi ESP-NOW
+  mqttClient.setServer(mqtt_server, mqtt_port);
+
   if (esp_now_init() == ESP_OK) {
     esp_now_register_recv_cb(OnDataRecv);
-    Serial.println(">>> ESP-NOW Berhasil. Menunggu data...");
   }
 
-  // Interval timer Blynk diatur ke 1000 ms (1 detik)
   timerBlynk.setInterval(INTERVAL_BLYNK_SEND, kirimDataBlynk);
   
   delay(1500); lcd.clear();
-  unsigned long skr = millis();
-  waktuDHTSebelumnya = skr - INTERVAL_DHT;
-  waktuTanahSebelumnya = skr - INTERVAL_TANAH;
-  waktuPHSebelumnya = skr - INTERVAL_PH;
-  waktuLCDSebelumnya = skr - INTERVAL_LCD;
 }
 
 // ==========================================================
@@ -477,20 +491,28 @@ void setup() {
 void loop() {
   unsigned long waktuSekarang = millis();
 
+  // 1. Baca Perintah Manual dari Serial Monitor
+  bacaSerialMonitor();
+
+  // 2. Proses Jaringan IoT (WiFi, Blynk, Thinger, MQTT)
   prosesKoneksiWiFiBlynk(waktuSekarang); 
-  
-  // Menjaga agar paket jaringan ESP32 bebas dan tidak menabrak Blynk
   thing.handle();                        
+  prosesKoneksiMQTT(waktuSekarang); 
   
+  // 3. Proses Pembacaan Sensor (Akan dilewati jika Mode Manual aktif)
   prosesDHT(waktuSekarang);              
   prosesKelembapanTanah(waktuSekarang);  
   prosesPHTanah(waktuSekarang);          
   
+  // 4. Evaluasi Kondisi Kipas & Pompa Berdasarkan Data (Manual/Sensor)
+  evaluasiUdara(); // <-- Posisinya dipindah agar Kipas merespon input Serial Manual
   prosesPompa();            
   
+  // 5. Tampilkan ke Layar LCD & Serial
   prosesLCD(waktuSekarang);              
-  
-  timerBlynk.run();                      
   tampilkanSemuaData(waktuSekarang);     
+  
+  // 6. Pengiriman ke Cloud secara berkala
+  timerBlynk.run();                      
   kirimKeGoogleSheets(waktuSekarang);    
 }
